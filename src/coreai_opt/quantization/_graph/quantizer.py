@@ -85,9 +85,7 @@ from ._annotation_pattern_registry import (
 )
 from ._annotation_utils import (
     _get_input_qspec_map,
-    adjust_output_qspec_for_qscheme_and_propagate,
     annotate_module_level_specs as _annotate_module_level_specs,
-    is_node_annotated,
 )
 from ._conv_bn_utils import (
     fold_conv_bn_weights as _fold_conv_bn_weights,
@@ -97,6 +95,11 @@ from ._prepare_for_export import (
     _move_cache_dequant_to_output,
     prepare_for_mil_export,
     prepare_for_mlir_export,
+)
+from ._qspec_reconcile import (
+    _AnnotationContext,
+    _nodes_covered_by,
+    annotate_via_reconciliation,
 )
 from ._utils import (
     force_per_tensor_for_channel_altering_ops as _force_per_tensor_for_channel_altering_ops,
@@ -260,39 +263,68 @@ class _AnnotationHandler(TorchPT2EQuantizer):
         if not isinstance(model, torch.fx.GraphModule):
             raise TypeError("Model must be a torch.fx.GraphModule")
 
-        # Matching phase - apply all annotators to model
+        # Match all annotator patterns.
         node_to_annotator_match_info_dict = self._match_all_annotators(model)
 
-        # Sorting phase - sort all matches in the order to try annotating in
+        # Sort matches into priority order (config-level > pattern-length > topo).
+        # Used to pick each node's winning config when multiple matches touch it.
         sorted_nodes_with_annotation_match_info = self._sort_nodes_in_annotation_order(
             model, node_to_annotator_match_info_dict
         )
 
-        # Annotation phase - go through sorted nodes with matches list to annotate
+        # Winning config per node + priority + pattern group. Pattern-match
+        # dicts key on a single primary node but annotate every covered node
+        # (Conv+Sigmoid annotates both conv and sigmoid); expand the coverage
+        # so every covered node has (config, priority, pattern_group) for
+        # its slots. Priority = position in the sorted list (lower = higher
+        # priority); used by reconcile() to break dtype ties within a
+        # shared-observer group.
+        winning_configs: dict[torch.fx.Node, Any] = {}
+        node_priorities: dict[torch.fx.Node, int] = {}
+        pattern_groups: dict[torch.fx.Node, frozenset[torch.fx.Node]] = {}
+        for priority, (_primary_node, cfg, match_info) in enumerate(
+            sorted_nodes_with_annotation_match_info
+        ):
+            covered = frozenset(_nodes_covered_by(match_info))
+            for covered_node in covered:
+                if covered_node in winning_configs:
+                    continue  # first (highest-priority) pattern wins
+                winning_configs[covered_node] = cfg
+                node_priorities[covered_node] = priority
+                pattern_groups[covered_node] = covered
+
         shared_observer_nodes = self._get_shared_observer_nodes(model)
-        # Build pass-invariant context once; shared by all annotator invocations.
+        # Build pass-invariant AnnotationContext once; still needed for the
+        # kv-cache-override pass below, which reuses the standard annotator
+        # helpers (``_get_input_qspec_map``) to compute its overrides.
         context = AnnotationContext(
             module_name_to_state_names_map=self._module_name_to_state_names_map,
             shared_observer_nodes=shared_observer_nodes,
         )
-        for node, config, annotator_match_info in sorted_nodes_with_annotation_match_info:
-            if is_node_annotated(node):
-                continue
-            annotation_config = AnnotationConfig.from_quantizer_config(config)
-            annotator_match_info.annotator_func(
-                annotator_match_info.annotator_match,
-                annotation_config,
-                context,
-            )
 
+        # Reconciliation pipeline. Replaces the previous per-node annotator
+        # loop and the Phase-6 post-pass (fixed-range/always-affine qscheme
+        # overrides): both are now expressed as OP_INTRINSIC_* provisional
+        # qspecs that participate in per-component reconciliation. Any
+        # ordering surprises produced by the old interleaved traversal
+        # (see YOLOX cat-of-sigmoid) are eliminated by construction; when a
+        # shared-observer group has conflicting dtypes, reconciliation picks
+        # the highest-priority proposal.
+        ctx = _AnnotationContext(
+            winning_configs=winning_configs,
+            node_priorities=node_priorities,
+            pattern_groups=pattern_groups,
+            shared_observer_nodes=shared_observer_nodes,
+        )
+        annotate_via_reconciliation(model, ctx)
+
+        # Module-level input/output/state overrides. TODO: fold these into
+        # reconciliation as USER_CONFIG_* proposals so they participate in
+        # unification (per design). For now they still run as a post-pass and
+        # overwrite reconciled specs on module-boundary nodes.
         _annotate_module_level_specs(
             self._module_configs, self._module_name_to_state_names_map, model
         )
-
-        # Post-annotation graph pass to go through the model and adjust any qspecs which
-        # are following always affine or fixed range nodes.
-        for node in model.graph.nodes:
-            adjust_output_qspec_for_qscheme_and_propagate(node, shared_observer_nodes)
 
         # Force-apply each cache spec last so it wins over any module-scope
         # annotation that may have claimed the cache op via a wildcard. Cache

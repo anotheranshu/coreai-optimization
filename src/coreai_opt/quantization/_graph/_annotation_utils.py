@@ -270,6 +270,11 @@ def adjust_output_qspec_for_qscheme_and_propagate(
     if qspec is None:
         return
 
+    # If the output is already shared with another edge/node, that share
+    # dictates the observer/qscheme — don't override it here.
+    if isinstance(qspec, _SharedQuantizationSpec):
+        return
+
     # ReLU6 activation maps to torch.ops.aten.hardtanh.default with
     # min_val = 0 and max_val = 6
     is_always_affine_op = node.target in _always_affine_ops or (
