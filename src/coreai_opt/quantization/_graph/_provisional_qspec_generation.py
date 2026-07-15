@@ -72,7 +72,7 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def build_initial_state(
+def build_initial_provisional_qspecs(
     model: fx.GraphModule,
     winning_configs: dict[fx.Node, OpQuantizerConfig],
     node_priorities: dict[fx.Node, int],

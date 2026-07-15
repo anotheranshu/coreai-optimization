@@ -39,7 +39,7 @@ from collections import deque
 
 import torch.fx as fx
 
-from ._provisional_qspec_generation import build_initial_state
+from ._provisional_qspec_generation import build_initial_provisional_qspecs
 from ._qspec_constraint_generation import (
     _AnnotationContext,
     _generate_constraints_for_node,
@@ -60,7 +60,7 @@ def annotate_via_reconciliation(
     model: fx.GraphModule, ctx: _AnnotationContext
 ) -> fx.GraphModule:
     """Annotate ``model`` in place using the constraint-queue reconciler."""
-    qspecs = build_initial_state(
+    qspecs = build_initial_provisional_qspecs(
         model,
         winning_configs=ctx.winning_configs,
         node_priorities=ctx.node_priorities,

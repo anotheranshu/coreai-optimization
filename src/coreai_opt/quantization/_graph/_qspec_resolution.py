@@ -29,7 +29,6 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-from typing import Any
 
 import torch.fx as fx
 from torchao.quantization.pt2e.quantizer import (
@@ -37,6 +36,11 @@ from torchao.quantization.pt2e.quantizer import (
     QuantizationSpec as TorchAOQuantizationSpec,
     SharedQuantizationSpec as _SharedQuantizationSpec,
 )
+
+# One of these is assigned to every observed slot: a concrete spec on
+# the group's anchor slot, a SharedQuantizationSpec pointing at the
+# anchor on every other slot in the group.
+_SlotSpec = TorchAOQuantizationSpec | _SharedQuantizationSpec
 from torchao.quantization.pt2e.quantizer.quantizer import Q_ANNOTATION_KEY
 
 from ._qspec_types import (
@@ -62,7 +66,7 @@ def resolve_qspecs(model: fx.GraphModule, qspecs: ProvisionalQSpecMap) -> None:
     groups = _group_slots_by_qspec_identity(qspecs)
     topo_index = _topo_index(model)
 
-    slot_assignments: dict[NodeSlot, Any] = {}
+    slot_assignments: dict[NodeSlot, _SlotSpec] = {}
     for group in groups:
         _assign_group_specs(group, topo_index, slot_assignments)
 
@@ -159,7 +163,7 @@ def _pick_anchor(group: _QSpecGroup, topo_index: dict[fx.Node, int]) -> NodeSlot
 def _assign_group_specs(
     group: _QSpecGroup,
     topo_index: dict[fx.Node, int],
-    slot_assignments: dict[NodeSlot, Any],
+    slot_assignments: dict[NodeSlot, _SlotSpec],
 ) -> None:
     """Fill ``slot_assignments`` with the spec each slot in ``group`` should carry.
 
@@ -246,13 +250,13 @@ def _build_concrete_spec(qspec: ProvisionalQSpec) -> TorchAOQuantizationSpec | N
 
 
 def _bucket_per_node(
-    slot_assignments: dict[NodeSlot, Any],
-) -> tuple[dict[fx.Node, dict[fx.Node, Any]], dict[fx.Node, Any]]:
+    slot_assignments: dict[NodeSlot, _SlotSpec],
+) -> tuple[dict[fx.Node, dict[fx.Node, _SlotSpec]], dict[fx.Node, _SlotSpec]]:
     """Split per-slot spec assignments into per-node ``input_qspec_map``
     and per-node ``output_qspec`` buckets.
     """
-    per_node_inputs: dict[fx.Node, dict[fx.Node, Any]] = defaultdict(dict)
-    per_node_outputs: dict[fx.Node, Any] = {}
+    per_node_inputs: dict[fx.Node, dict[fx.Node, _SlotSpec]] = defaultdict(dict)
+    per_node_outputs: dict[fx.Node, _SlotSpec] = {}
     for slot, spec in slot_assignments.items():
         if slot.kind is SlotKind.OUTPUT:
             per_node_outputs[slot.node] = spec
@@ -264,8 +268,8 @@ def _bucket_per_node(
 
 def _write_annotations(
     model: fx.GraphModule,
-    per_node_inputs: dict[fx.Node, dict[fx.Node, Any]],
-    per_node_outputs: dict[fx.Node, Any],
+    per_node_inputs: dict[fx.Node, dict[fx.Node, _SlotSpec]],
+    per_node_outputs: dict[fx.Node, _SlotSpec],
 ) -> None:
     """Mutate each touched node's meta with a :class:`QuantizationAnnotation`.
 
@@ -290,8 +294,8 @@ def _write_annotations(
 
 
 def _backfill_input_qspec_map(
-    node: fx.Node, input_map: dict[fx.Node, Any]
-) -> dict[fx.Node, Any]:
+    node: fx.Node, input_map: dict[fx.Node, _SlotSpec]
+) -> dict[fx.Node, _SlotSpec | None]:
     """Return an ``input_qspec_map`` with an entry for every
     ``node.all_input_nodes`` position — explicit specs where set,
     ``None`` otherwise.
