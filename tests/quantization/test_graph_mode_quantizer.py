@@ -16,6 +16,10 @@ import torch
 import torch.nn as nn
 from torch.export.dynamic_shapes import Dim
 from torch.ops import coreai
+from torchao.quantization.pt2e.quantizer import (
+    QuantizationSpec as TorchAOQuantizationSpec,
+    SharedQuantizationSpec,
+)
 
 from coreai_opt import ExportBackend
 from coreai_opt._utils.metadata_utils import (
@@ -660,6 +664,127 @@ class TestAnnotationHandler:
             f"Expected annotate_single_pattern to be called {NUM_PATTERNS} times, but "
             f"was called {temp_pattern.match_single_pattern_call_count} times"
         )
+
+
+class TestCatOfSigmoidReconciliation:
+    """End-to-end reconciliation on a YOLOX-shape cat-of-sigmoid model.
+
+    Exercises the full annotation pipeline (pattern match → reconcile →
+    resolve) on the pattern that motivated the reconciler: a ``cat`` group
+    whose branches disagree on qscheme (one plain conv branch wants
+    symmetric; two sigmoid branches want affine via op-intrinsic override).
+    The reconciler must lattice-join to affine, pick a topo-first anchor,
+    and give every other slot a SharedQuantizationSpec pointing at it.
+    """
+
+    class _CatOfSigmoid(nn.Module):
+        """``cat([reg_conv(x), sigmoid(obj_conv(x)), sigmoid(cls_conv(x))])``."""
+
+        def __init__(self) -> None:
+            super().__init__()
+            self.reg = nn.Conv2d(3, 4, kernel_size=1)
+            self.obj = nn.Conv2d(3, 1, kernel_size=1)
+            self.cls = nn.Conv2d(3, 8, kernel_size=1)
+
+        def forward(self, x: torch.Tensor) -> torch.Tensor:
+            r = self.reg(x)
+            o = torch.sigmoid(self.obj(x))
+            c = torch.sigmoid(self.cls(x))
+            return torch.cat([r, o, c], dim=1)
+
+    @staticmethod
+    def _by_target(model: torch.fx.GraphModule, needle: str) -> list[torch.fx.Node]:
+        return [
+            n for n in model.graph.nodes
+            if n.op == "call_function" and needle in str(n.target)
+        ]
+
+    @staticmethod
+    def _annotation(node: torch.fx.Node):
+        from torchao.quantization.pt2e.quantizer.quantizer import Q_ANNOTATION_KEY
+        return node.meta.get(Q_ANNOTATION_KEY)
+
+    def test_cat_of_sigmoid_shared_observer_topology(
+        self, weight_input_act_output_act_config
+    ):
+        """Every branch in the cat group should end up pointing at one anchor.
+
+        Load-bearing invariants:
+
+        - ``conv2d`` (the ``reg`` branch — topologically first covered node
+          in the cat group) carries the concrete ``QuantizationSpec``.
+        - Its qscheme is ``per_tensor_affine``, not symmetric — the two
+          sigmoid branches force affine via op-intrinsic override, and the
+          qscheme lattice-join takes the looser of the two.
+        - ``sigmoid``, ``sigmoid_1``, and ``cat`` all have
+          ``output_qspec = SharedQuantizationSpec(edge_or_node=conv2d)``.
+        - The cat's three input slots also share on ``conv2d``.
+        - ``conv2d_1`` / ``conv2d_2`` (the two convs feeding the sigmoids
+          inside the pattern group) have no ``output_qspec`` — the
+          internal-edge slot is intentionally left unannotated so torchao
+          doesn't insert a second observer between them and their sigmoid.
+        """
+        model = self._CatOfSigmoid().eval()
+        example_inputs = (torch.randn(1, 3, 8, 8),)
+
+        prepared = Quantizer(model, weight_input_act_output_act_config).prepare(
+            example_inputs
+        )
+
+        convs = self._by_target(prepared, "conv2d")
+        sigmoids = self._by_target(prepared, "sigmoid")
+        cats = self._by_target(prepared, "cat")
+
+        assert [n.name for n in convs] == ["conv2d", "conv2d_1", "conv2d_2"]
+        assert [n.name for n in sigmoids] == ["sigmoid", "sigmoid_1"]
+        assert [n.name for n in cats] == ["cat"]
+
+        anchor, internal_conv_1, internal_conv_2 = convs
+        sigmoid_a, sigmoid_b = sigmoids
+        (cat_node,) = cats
+
+        # Anchor carries a concrete spec, lattice-joined to affine.
+        anchor_ann = self._annotation(anchor)
+        assert anchor_ann is not None and anchor_ann._annotated
+        assert isinstance(anchor_ann.output_qspec, TorchAOQuantizationSpec)
+        assert anchor_ann.output_qspec.qscheme == torch.per_tensor_affine
+        assert anchor_ann.output_qspec.dtype == torch.int8
+
+        # The two convs feeding the sigmoid pattern get no output_qspec:
+        # the sigmoid is annotated on the shared side and the intermediate
+        # edge is pattern-internal.
+        for internal in (internal_conv_1, internal_conv_2):
+            internal_ann = self._annotation(internal)
+            assert internal_ann is not None
+            assert internal_ann.output_qspec is None, (
+                f"{internal.name} is a pattern-internal producer feeding "
+                f"sigmoid; its output slot must not be annotated."
+            )
+
+        # Every other slot in the group shares on the anchor.
+        for sharer in (sigmoid_a, sigmoid_b, cat_node):
+            sharer_ann = self._annotation(sharer)
+            assert sharer_ann is not None and sharer_ann._annotated
+            assert isinstance(sharer_ann.output_qspec, SharedQuantizationSpec)
+            assert sharer_ann.output_qspec.edge_or_node is anchor, (
+                f"{sharer.name}.output_qspec should share on {anchor.name}, "
+                f"got {sharer_ann.output_qspec.edge_or_node}"
+            )
+
+        # cat's three inputs share on the anchor too.
+        cat_ann = self._annotation(cat_node)
+        cat_input_producers = list(cat_ann.input_qspec_map.keys())
+        assert cat_input_producers == [anchor, sigmoid_a, sigmoid_b]
+        for producer, input_spec in cat_ann.input_qspec_map.items():
+            assert isinstance(input_spec, SharedQuantizationSpec), (
+                f"cat.input[{producer.name}] should be a SharedQuantizationSpec, "
+                f"got {type(input_spec).__name__}"
+            )
+            assert input_spec.edge_or_node is anchor
+
+        # Sanity: model still runs forward after annotation.
+        out = prepared(*example_inputs)
+        assert out.shape == (1, 4 + 1 + 8, 8, 8)
 
 
 class TestAPIOrdering:
