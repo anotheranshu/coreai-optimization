@@ -6,9 +6,10 @@
 """Unit tests for the constraint-queue qspec reconciliation pipeline.
 
 Tests here are pure — they construct :class:`ProvisionalQSpec`
-:class:`State` maps and :class:`Constraint`s by hand and exercise
-``.apply()`` directly. No fx graph construction. End-to-end pipeline
-behavior is covered by trace-driven checks against the walkthrough toy.
+:class:`ProvisionalQSpecMap` values and :class:`Constraint`s by hand and
+exercise ``.apply()`` directly. No fx graph construction. End-to-end
+pipeline behavior is covered by trace-driven checks against the
+walkthrough toy.
 """
 
 from unittest.mock import Mock
@@ -17,17 +18,19 @@ import pytest
 import torch
 from torchao.quantization.pt2e.observer import MinMaxObserver
 
-from coreai_opt.quantization._graph._qspec_reconcile import (
+from coreai_opt.quantization._graph._qspec_constraints import (
+    ShareFields,
+    ShareObserverInstance,
+    _reconcile_field,
+)
+from coreai_opt.quantization._graph._qspec_types import (
     FieldName,
     FieldValue,
     NodeSlot,
     ProvisionalQSpec,
+    ProvisionalQSpecMap,
     ReconciliationError,
-    ShareFields,
-    ShareObserverInstance,
     SlotKind,
-    State,
-    _reconcile_field,
 )
 
 # ---------------------------------------------------------------------------
@@ -58,7 +61,7 @@ def _fv(value, priority: int = 0) -> FieldValue:
 class TestReconcileField:
     def test_dtype_priority_wins(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(DTYPE=_fv(torch.int4, priority=1)),
             b: _pspec(DTYPE=_fv(torch.int8, priority=5)),
         }
@@ -68,7 +71,7 @@ class TestReconcileField:
 
     def test_dtype_tie_first_encountered(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(DTYPE=_fv(torch.int8, priority=3)),
             b: _pspec(DTYPE=_fv(torch.int4, priority=3)),
         }
@@ -78,7 +81,7 @@ class TestReconcileField:
 
     def test_qscheme_lattice_symmetric_and_affine(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(QSCHEME=_fv(torch.per_tensor_symmetric, priority=0)),
             b: _pspec(QSCHEME=_fv(torch.per_tensor_affine, priority=5)),
         }
@@ -88,7 +91,7 @@ class TestReconcileField:
 
     def test_qscheme_lattice_per_tensor_and_per_channel(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(QSCHEME=_fv(torch.per_tensor_symmetric, priority=0)),
             b: _pspec(QSCHEME=_fv(torch.per_channel_symmetric, priority=0)),
         }
@@ -97,7 +100,7 @@ class TestReconcileField:
 
     def test_range_min_union(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(QUANT_MIN=_fv(-127, priority=0)),
             b: _pspec(QUANT_MIN=_fv(-128, priority=5)),
         }
@@ -107,7 +110,7 @@ class TestReconcileField:
 
     def test_range_max_union(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(QUANT_MAX=_fv(127, priority=0)),
             b: _pspec(QUANT_MAX=_fv(255, priority=5)),
         }
@@ -117,7 +120,7 @@ class TestReconcileField:
 
     def test_ch_axis_must_agree(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(CH_AXIS=_fv(0, priority=0)),
             b: _pspec(CH_AXIS=_fv(1, priority=0)),
         }
@@ -126,7 +129,7 @@ class TestReconcileField:
 
     def test_is_dynamic_must_agree(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(IS_DYNAMIC=_fv(True, priority=0)),
             b: _pspec(IS_DYNAMIC=_fv(False, priority=0)),
         }
@@ -135,7 +138,7 @@ class TestReconcileField:
 
     def test_missing_field_returns_none(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {a: _pspec(), b: _pspec()}
+        state: ProvisionalQSpecMap = {a: _pspec(), b: _pspec()}
         assert _reconcile_field(FieldName.DTYPE, frozenset({a, b}), state) is None
 
 
@@ -147,7 +150,7 @@ class TestReconcileField:
 class TestShareFields:
     def test_broadcasts_winner_to_all_slots(self) -> None:
         a, b, c = _slot("a"), _slot("b"), _slot("c")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(DTYPE=_fv(torch.int4, priority=0)),
             b: _pspec(DTYPE=_fv(torch.int8, priority=5)),
             c: _pspec(),  # no proposal
@@ -164,7 +167,7 @@ class TestShareFields:
 
     def test_noop_when_already_reconciled(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(DTYPE=_fv(torch.int8, priority=0)),
             b: _pspec(DTYPE=_fv(torch.int8, priority=0)),
         }
@@ -173,7 +176,7 @@ class TestShareFields:
 
     def test_multiple_fields(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(
                 DTYPE=_fv(torch.int4, priority=0),
                 QSCHEME=_fv(torch.per_tensor_symmetric, priority=0),
@@ -203,7 +206,7 @@ class TestShareFields:
 class TestShareObserverInstance:
     def test_merges_two_slots_into_one_instance(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(DTYPE=_fv(torch.int8, priority=0)),
             b: _pspec(DTYPE=_fv(torch.int8, priority=0)),
         }
@@ -214,7 +217,7 @@ class TestShareObserverInstance:
 
     def test_field_mutation_after_share_propagates(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {a: _pspec(), b: _pspec()}
+        state: ProvisionalQSpecMap = {a: _pspec(), b: _pspec()}
         ShareObserverInstance(_slots=frozenset({a, b})).apply(state)
         state[a].fields[FieldName.DTYPE] = _fv(torch.int8, 0)
         # b's ProvisionalQSpec is the same object → sees the new field.
@@ -222,7 +225,7 @@ class TestShareObserverInstance:
 
     def test_transitive_merge_pulls_in_prior_sharers(self) -> None:
         a, b, c = _slot("a"), _slot("b"), _slot("c")
-        state: State = {a: _pspec(), b: _pspec(), c: _pspec()}
+        state: ProvisionalQSpecMap = {a: _pspec(), b: _pspec(), c: _pspec()}
         # First merge a and b.
         ShareObserverInstance(_slots=frozenset({a, b})).apply(state)
         assert state[a] is state[b]
@@ -232,7 +235,7 @@ class TestShareObserverInstance:
 
     def test_reconciles_fields_across_merged_group(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(DTYPE=_fv(torch.int4, priority=0)),
             b: _pspec(DTYPE=_fv(torch.int8, priority=5)),
         }
@@ -244,7 +247,7 @@ class TestShareObserverInstance:
     def test_noop_when_already_shared_with_correct_fields(self) -> None:
         a, b = _slot("a"), _slot("b")
         shared = _pspec(DTYPE=_fv(torch.int8, priority=0))
-        state: State = {a: shared, b: shared}
+        state: ProvisionalQSpecMap = {a: shared, b: shared}
         changed = ShareObserverInstance(_slots=frozenset({a, b})).apply(state)
         assert changed == set()
         assert state[a] is shared
@@ -259,7 +262,7 @@ class TestShareObserverInstance:
 class TestConvergence:
     def test_repeated_share_fields_stabilizes(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {
+        state: ProvisionalQSpecMap = {
             a: _pspec(DTYPE=_fv(torch.int4, priority=1)),
             b: _pspec(DTYPE=_fv(torch.int8, priority=5)),
         }
@@ -272,7 +275,7 @@ class TestConvergence:
 
     def test_repeated_share_observer_stabilizes(self) -> None:
         a, b = _slot("a"), _slot("b")
-        state: State = {a: _pspec(), b: _pspec()}
+        state: ProvisionalQSpecMap = {a: _pspec(), b: _pspec()}
         con = ShareObserverInstance(_slots=frozenset({a, b}))
         first = con.apply(state)
         assert first
@@ -293,7 +296,7 @@ def test_yolox_scenario_end_to_end_reconciliation() -> None:
     sig_b_out = _slot("sig_b_out")
     cat_out = _slot("cat_out")
 
-    state: State = {
+    state: ProvisionalQSpecMap = {
         conv_out: _pspec(
             DTYPE=_fv(torch.int8, priority=5),
             QSCHEME=_fv(torch.per_tensor_symmetric, priority=5),
@@ -346,7 +349,7 @@ def test_adjacent_edge_share_resolves_dtype_conflict_by_priority() -> None:
     sharing merges them; priority resolves dtype to int8."""
     linear1_out = _slot("linear1_out", kind=SlotKind.OUTPUT)
     linear2_in = _slot("linear2_in", kind=SlotKind.INPUT)
-    state: State = {
+    state: ProvisionalQSpecMap = {
         linear1_out: _pspec(
             DTYPE=_fv(torch.int4, priority=5),
             QSCHEME=_fv(torch.per_tensor_symmetric, priority=5),
@@ -375,7 +378,7 @@ def test_share_fields_dtype_only_leaves_scale_independent() -> None:
     scale/zp (via observer instance) stays per-input."""
     a_out = _slot("a_out")
     b_out = _slot("b_out")
-    state: State = {
+    state: ProvisionalQSpecMap = {
         a_out: _pspec(DTYPE=_fv(torch.int8, priority=0)),
         b_out: _pspec(DTYPE=_fv(torch.int4, priority=5)),
     }

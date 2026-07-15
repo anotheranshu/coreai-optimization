@@ -3626,6 +3626,12 @@ class TestAnnotationPattern:
                 patterns = [mock_pattern_1]
                 return patterns
 
+            @classmethod
+            def generate_qspec_sharing_constraints(cls, node, qspecs):
+                # Stub — abstract on the base class; unused by this test,
+                # which only exercises the length-validation branch.
+                return []
+
         pattern = Pattern()
         with pytest.raises(RuntimeError):
             pattern.get_patterns()

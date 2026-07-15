@@ -23,6 +23,19 @@ from ._annotation_config import (
 from ._annotation_utils import (
     OpsListPattern as _OpsListPattern,
 )
+from ._qspec_constraints import (
+    Constraint,
+    PER_CHANNEL_SCHEMES,
+    ShareFields,
+    ShareObserverInstance,
+)
+from ._qspec_types import (
+    FieldName,
+    NodeSlot,
+    ProvisionalQSpec,
+    ProvisionalQSpecMap,
+    SlotKind,
+)
 
 # Generic type variable for match results
 MatchType = TypeVar("MatchType")
@@ -349,6 +362,10 @@ class SharedObserverModulePattern(BaseAnnotationPattern[tuple[SourcePartition]])
 
     Subclasses must implement the generate_patterns() method to define the
     specific patterns they want to match (e.g., maxpool, avgpool, flatten, etc.).
+
+    Subclasses must also implement :meth:`generate_qspec_sharing_constraints`
+    to declare how quantization specs are shared across the op's input and
+    output slots. Missing this override raises ``TypeError`` at instantiation.
     """
 
     @classmethod
@@ -358,6 +375,34 @@ class SharedObserverModulePattern(BaseAnnotationPattern[tuple[SourcePartition]])
         SharedObserverModulePattern.
         """
         return _annotation_utils.annotate_shared_observer_match
+
+    @classmethod
+    @abstractmethod
+    def generate_qspec_sharing_constraints(
+        cls,
+        node: torch.fx.Node,
+        qspecs: ProvisionalQSpecMap,
+    ) -> list[Constraint]:
+        """Return the constraints that express this op's qspec-sharing semantics.
+
+        Called by the reconciler once per matched shared-observer node with
+        the current provisional-qspec state. Each subclass owns the decision
+        of which of its input / output slots must share dtype, is_dynamic,
+        or a full observer instance.
+
+        Args:
+            node (torch.fx.Node): The matched op node whose slots the
+                returned constraints reference.
+            qspecs (ProvisionalQSpecMap): Current provisional-qspec state,
+                available for dynamic peeking (e.g. concat's axis-aware
+                observer-sharing decision reads the current output-slot
+                qscheme and ch_axis).
+
+        Returns:
+            list[Constraint]: Constraints to enqueue. Empty list means
+            "no sharing this op wants to enforce."
+        """
+        raise NotImplementedError
 
     @classmethod
     def _validate_patterns_length(cls):
@@ -386,6 +431,32 @@ class SharedObserverModulePattern(BaseAnnotationPattern[tuple[SourcePartition]])
             raise RuntimeError(error_msg)
 
         return _annotation_utils.match_pattern_with_sequential_partitions(model, pattern)
+
+
+def _shared_op_boundary_slots(node: torch.fx.Node) -> tuple[NodeSlot, list[NodeSlot]]:
+    """Return the output slot and list of input slots on a shared-observer node.
+
+    Utility for :class:`SharedObserverModulePattern` subclass implementations
+    of :meth:`generate_qspec_sharing_constraints`.
+    """
+    output_slot = NodeSlot(node=node, kind=SlotKind.OUTPUT, arg_index=0)
+    input_slots = [
+        NodeSlot(node=node, kind=SlotKind.INPUT, arg_index=arg_index)
+        for arg_index in range(len(node.all_input_nodes))
+    ]
+    return output_slot, input_slots
+
+
+def _any_input_slot_populated(
+    input_slots: list[NodeSlot], qspecs: ProvisionalQSpecMap
+) -> bool:
+    """Return True iff any of the input slots already has a proposal in ``qspecs``.
+
+    The shared-observer sharing rule for cat / maxpool / etc. only fires when
+    at least one input side wants observation — otherwise there's nothing
+    for the sharing to enforce.
+    """
+    return any(input_slot in qspecs for input_slot in input_slots)
 
 
 class _AnnotationPatternRegistry(ClassRegistryMixin):
@@ -787,6 +858,13 @@ class FlattenPattern(SharedObserverModulePattern):
         """Returns flatten pattern."""
         return _get_all_patterns_from_base_ops({"flatten"})
 
+    @classmethod
+    def generate_qspec_sharing_constraints(
+        cls, node: torch.fx.Node, qspecs: ProvisionalQSpecMap
+    ) -> list[Constraint]:
+        """All slots share one observer instance — flatten preserves values."""
+        return _all_slots_share_observer(node, qspecs)
+
 
 @_AnnotationPatternRegistry.register("maxpool")
 class MaxPoolPattern(SharedObserverModulePattern):
@@ -804,6 +882,13 @@ class MaxPoolPattern(SharedObserverModulePattern):
                 "max_pool3d",
             }
         )
+
+    @classmethod
+    def generate_qspec_sharing_constraints(
+        cls, node: torch.fx.Node, qspecs: ProvisionalQSpecMap
+    ) -> list[Constraint]:
+        """All slots share one observer instance — maxpool preserves values."""
+        return _all_slots_share_observer(node, qspecs)
 
 
 @_AnnotationPatternRegistry.register("avgpool")
@@ -827,6 +912,13 @@ class AvgPoolPattern(SharedObserverModulePattern):
             }
         )
 
+    @classmethod
+    def generate_qspec_sharing_constraints(
+        cls, node: torch.fx.Node, qspecs: ProvisionalQSpecMap
+    ) -> list[Constraint]:
+        """All slots share one observer instance — averaging preserves range roughly."""
+        return _all_slots_share_observer(node, qspecs)
+
 
 @_AnnotationPatternRegistry.register("concat")
 class ConcatPattern(SharedObserverModulePattern):
@@ -838,3 +930,65 @@ class ConcatPattern(SharedObserverModulePattern):
     def generate_patterns(cls) -> list[torch.fx.GraphModule]:
         """Returns concat pattern."""
         return _get_all_patterns_from_base_ops({"cat", "concat"})
+
+    @classmethod
+    def generate_qspec_sharing_constraints(
+        cls, node: torch.fx.Node, qspecs: ProvisionalQSpecMap
+    ) -> list[Constraint]:
+        """Axis-aware sharing:
+
+        * All slots always share ``DTYPE`` and ``IS_DYNAMIC``.
+        * If the reconciled output qscheme is per-channel along the concat
+          dimension, each input keeps its own scale — no observer-instance
+          sharing needed. Per-channel along a *different* axis (or per-tensor)
+          requires all inputs to observe together.
+        """
+        output_slot, input_slots = _shared_op_boundary_slots(node)
+        if not _any_input_slot_populated(input_slots, qspecs):
+            return []
+
+        all_slots = frozenset([output_slot, *input_slots])
+        constraints: list[Constraint] = [
+            ShareFields(
+                _slots=all_slots,
+                fields=frozenset({FieldName.DTYPE, FieldName.IS_DYNAMIC}),
+            )
+        ]
+
+        concat_dim = _concat_dim(node)
+        output_qspec = qspecs.get(output_slot, ProvisionalQSpec()).fields
+        output_qscheme = output_qspec.get(FieldName.QSCHEME)
+        output_ch_axis = output_qspec.get(FieldName.CH_AXIS)
+
+        per_channel_along_concat_axis = (
+            output_qscheme is not None
+            and output_qscheme.value in PER_CHANNEL_SCHEMES
+            and output_ch_axis is not None
+            and output_ch_axis.value == concat_dim
+        )
+        if not per_channel_along_concat_axis:
+            constraints.append(ShareObserverInstance(_slots=all_slots))
+        return constraints
+
+
+def _all_slots_share_observer(
+    node: torch.fx.Node, qspecs: ProvisionalQSpecMap
+) -> list[Constraint]:
+    """Emit ``ShareObserverInstance`` across the op's input + output slots.
+
+    Used by shared-observer ops (flatten, maxpool, avgpool) whose sharing
+    semantics don't depend on any spec field — they always tie every input
+    and output slot into one observer instance when at least one input
+    side wants observation.
+    """
+    output_slot, input_slots = _shared_op_boundary_slots(node)
+    if not _any_input_slot_populated(input_slots, qspecs):
+        return []
+    return [ShareObserverInstance(_slots=frozenset([output_slot, *input_slots]))]
+
+
+def _concat_dim(node: torch.fx.Node) -> int:
+    """Concat dim from ``aten.cat(tensors, dim=?)`` (defaults to 0)."""
+    if len(node.args) >= 2:
+        return int(node.args[1])
+    return int(node.kwargs.get("dim", 0))

@@ -228,22 +228,30 @@ class _AnnotationHandler(TorchPT2EQuantizer):
         """Globally-registered patterns plus per-instance ``extra_patterns``."""
         return list(_AnnotationPatternRegistry.list_registry_values()) + self._extra_patterns
 
-    def _get_shared_observer_nodes(self, model: torch.fx.GraphModule) -> set[torch.fx.Node]:
-        """
-        Return a set of all shared observer nodes in the model.
+    def _get_shared_observer_nodes(
+        self, model: torch.fx.GraphModule
+    ) -> dict[torch.fx.Node, type[_SharedObserverModulePattern]]:
+        """Return every shared-observer node in the model, mapped to the
+        pattern class that matched it.
+
+        The pattern class is what owns the node's qspec-sharing semantics
+        (via :meth:`SharedObserverModulePattern.generate_qspec_sharing_constraints`).
+        Callers that only need the node set can take ``.keys()``.
         """
         shared_observer_annotators = [
-            a_class
-            for a_class in self._all_patterns()
-            if issubclass(a_class, _SharedObserverModulePattern)
+            annotator_class
+            for annotator_class in self._all_patterns()
+            if issubclass(annotator_class, _SharedObserverModulePattern)
         ]
-        shared_observer_nodes = set()
+        shared_observer_nodes: dict[
+            torch.fx.Node, type[_SharedObserverModulePattern]
+        ] = {}
         for annotator in shared_observer_annotators:
             node_to_annotator_and_match_dict = annotator._match_all_patterns(model)
-
-            # We only care about the nodes
             for node in node_to_annotator_and_match_dict:
-                shared_observer_nodes.add(node)
+                # First match wins if multiple patterns claim the same node —
+                # deterministic given registry iteration order.
+                shared_observer_nodes.setdefault(node, annotator)
         return shared_observer_nodes
 
     def annotate(self, model: torch.fx.GraphModule) -> torch.fx.GraphModule:
@@ -293,13 +301,15 @@ class _AnnotationHandler(TorchPT2EQuantizer):
                 node_priorities[covered_node] = priority
                 pattern_groups[covered_node] = covered
 
-        shared_observer_nodes = self._get_shared_observer_nodes(model)
+        shared_observer_node_to_pattern = self._get_shared_observer_nodes(model)
         # Build pass-invariant AnnotationContext once; still needed for the
         # kv-cache-override pass below, which reuses the standard annotator
-        # helpers (``_get_input_qspec_map``) to compute its overrides.
+        # helpers (``_get_input_qspec_map``) to compute its overrides. The
+        # legacy AnnotationContext expects a plain set of nodes, so hand it
+        # the dict's keys.
         context = AnnotationContext(
             module_name_to_state_names_map=self._module_name_to_state_names_map,
-            shared_observer_nodes=shared_observer_nodes,
+            shared_observer_nodes=set(shared_observer_node_to_pattern),
         )
 
         # Reconciliation pipeline. Replaces the previous per-node annotator
@@ -314,7 +324,7 @@ class _AnnotationHandler(TorchPT2EQuantizer):
             winning_configs=winning_configs,
             node_priorities=node_priorities,
             pattern_groups=pattern_groups,
-            shared_observer_nodes=shared_observer_nodes,
+            shared_observer_nodes=shared_observer_node_to_pattern,
         )
         annotate_via_reconciliation(model, ctx)
 
