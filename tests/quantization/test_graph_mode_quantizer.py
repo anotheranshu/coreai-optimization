@@ -625,10 +625,6 @@ class TestAnnotationHandler:
                 cls.match_single_pattern_call_count += 1
                 return {}
 
-            @classmethod
-            def get_annotator_func(cls):
-                pass
-
         yield TestAnnotator
 
         del _AnnotationPatternRegistry.REGISTRY[pattern_name]

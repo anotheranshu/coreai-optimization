@@ -4,10 +4,9 @@
 # be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
 from abc import ABC, abstractmethod
-from collections.abc import Callable
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Generic, TypeAlias, TypeVar
+from typing import Generic, TypeVar
 
 import torch
 from torch.fx.passes.utils.matcher_utils import InternalMatch
@@ -16,10 +15,6 @@ from torch.fx.passes.utils.source_matcher_utils import SourcePartition
 from coreai_opt._utils.registry_utils import ClassRegistryMixin
 
 from . import _annotation_utils
-from ._annotation_config import (
-    AnnotationConfig as _AnnotationConfig,
-    AnnotationContext as _AnnotationContext,
-)
 from ._annotation_utils import (
     OpsListPattern as _OpsListPattern,
 )
@@ -40,31 +35,17 @@ from ._qspec_types import (
 # Generic type variable for match results
 MatchType = TypeVar("MatchType")
 
-# Generic annotator function type.
-# The function is expected to take exactly 3 inputs:
-# 1. Matched nodes to annotate. The type of this entity is flexible depending
-#    on the implementation of the AnnotationPattern subclass. Whatever entity
-#    is returned in the subclass's match_single_pattern dictionary values will
-#    be passed into this function as the first input.
-# 2. Quantization Config to use when annotating the matched nodes (per-match,
-#    derived from OpQuantizerConfig).
-# 3. Annotation pass context. Holds pass-invariant inputs the annotator may
-#    need (the model's module-name-to-state-names map and the set of shared
-#    observer nodes computed at the start of this annotation pass).
-AnnotatorFunc: TypeAlias = Callable[[MatchType, _AnnotationConfig, _AnnotationContext], Any]
-
 
 @dataclass(frozen=True)
 class AnnotatorMatchInfo(Generic[MatchType]):
-    """
-    Holds info related to nodes matched with a particular annotator.
+    """Info about a single annotator's match on the graph.
 
-    annotator_func: A function used to annotate nodes in annotator_match
-    annotator_match: Nodes in the model matched with the annotator
-    pattern_length: Length of the annotation pattern
+    Attributes:
+        annotator_match (MatchType): Nodes in the model matched with the
+            annotator.
+        pattern_length (int): Length of the annotation pattern.
     """
 
-    annotator_func: AnnotatorFunc[MatchType]
     annotator_match: MatchType
     pattern_length: int
 
@@ -101,8 +82,6 @@ class BaseAnnotationPattern(Generic[MatchType], ABC):
     Base class for annotation patterns.
 
     Each pattern class should implement:
-    - get_annotator_func(): Returns a function used to annotate nodes in accordance with
-                            the Annotation pattern.
     - generate_patterns(): Returns list of graph modules representing
                            the patterns to match
     - match_single_pattern(): Matches graph for a single pattern
@@ -110,18 +89,6 @@ class BaseAnnotationPattern(Generic[MatchType], ABC):
 
     # Class-level cache for patterns
     _patterns: list[torch.fx.GraphModule | _OpsListPattern] | None = None
-
-    @classmethod
-    @abstractmethod
-    def get_annotator_func(cls) -> AnnotatorFunc[MatchType]:
-        """
-        Return a function which is used to annotate nodes in accordance with a
-        particular Annotation pattern.
-
-        Returns:
-            Function used to annotate nodes.
-        """
-        raise NotImplementedError
 
     @classmethod
     def get_patterns(cls) -> list[torch.fx.GraphModule | _OpsListPattern]:
@@ -252,7 +219,6 @@ class BaseAnnotationPattern(Generic[MatchType], ABC):
                 {
                     node: AnnotatorMatchInfo(
                         pattern_length=cls.get_pattern_length(),
-                        annotator_func=cls.get_annotator_func(),
                         annotator_match=match,
                     )
                     for node, match in node_to_match_dict.items()
@@ -276,14 +242,6 @@ class WeightedModulePattern(BaseAnnotationPattern[InternalMatch]):
     Where batch_norm and activation are optional components that may or may not
     be present in the pattern.
     """
-
-    @classmethod
-    def get_annotator_func(cls) -> AnnotatorFunc[InternalMatch]:
-        """
-        Return a function which is used to annotate nodes in accordance with
-        WeightedModulePattern.
-        """
-        return _annotation_utils.annotate_weighted_mod_match
 
     @classmethod
     def match_single_pattern(
@@ -324,14 +282,6 @@ class NAryActPattern(BaseAnnotationPattern[tuple[SourcePartition]]):
     """
 
     @classmethod
-    def get_annotator_func(cls) -> AnnotatorFunc[tuple[SourcePartition]]:
-        """
-        Return a function which is used to annotate nodes in accordance with
-        NAryActPattern.
-        """
-        return _annotation_utils.annotate_n_ary_act_match
-
-    @classmethod
     def match_single_pattern(
         cls, model: torch.fx.GraphModule, pattern: torch.fx.GraphModule | _OpsListPattern
     ) -> dict[torch.fx.Node, tuple[SourcePartition]]:
@@ -367,14 +317,6 @@ class SharedObserverModulePattern(BaseAnnotationPattern[tuple[SourcePartition]])
     to declare how quantization specs are shared across the op's input and
     output slots. Missing this override raises ``TypeError`` at instantiation.
     """
-
-    @classmethod
-    def get_annotator_func(cls) -> AnnotatorFunc[tuple[SourcePartition]]:
-        """
-        Return a function which is used to annotate nodes in accordance with
-        SharedObserverModulePattern.
-        """
-        return _annotation_utils.annotate_shared_observer_match
 
     @classmethod
     @abstractmethod

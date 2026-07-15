@@ -304,12 +304,9 @@ class _AnnotationHandler(TorchPT2EQuantizer):
         shared_observer_node_to_pattern = self._get_shared_observer_nodes(model)
         # Build pass-invariant AnnotationContext once; still needed for the
         # kv-cache-override pass below, which reuses the standard annotator
-        # helpers (``_get_input_qspec_map``) to compute its overrides. The
-        # legacy AnnotationContext expects a plain set of nodes, so hand it
-        # the dict's keys.
+        # helpers (``_get_input_qspec_map``) to compute its overrides.
         context = AnnotationContext(
             module_name_to_state_names_map=self._module_name_to_state_names_map,
-            shared_observer_nodes=set(shared_observer_node_to_pattern),
         )
 
         # Reconciliation pipeline. Replaces the previous per-node annotator
